@@ -23,6 +23,7 @@ outputs:
 runs:
   using: "docker"
   image: "docker://quay.io/vrozsypalek/argoworkflow-cli:v3.5.8-debian"
+  entrypoint: bash
   args:
      - /bin/bash
      - -c
