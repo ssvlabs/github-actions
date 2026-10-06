@@ -29,143 +29,105 @@ runs:
   using: "docker"
   image: "docker://quay.io/vrozsypalek/argoworkflow-cli@sha256:f077bff6ca1e76750c45b61bfa100a129d375aa77c2276362bc49f821999dfdb" # v3.5.8-debian
   # Inputs are read from the INPUT_* environment variables that the runner sets
-  # for docker actions. Never interpolate ${{ inputs.* }} into this script: the
-  # values can come from branch names and other user-controlled data.
+  # for docker actions. Never interpolate expressions on inputs into this
+  # script: the values can come from branch names and other user-controlled data.
+  #
+  # Keep every script line flush-left with no "\" continuations: the ARC
+  # Kubernetes container hook collapses a newline followed by whitespace into a
+  # single space, which turns indented blocks into syntax errors.
   args:
     - /bin/bash
     - -c
     - |
       set -euo pipefail
-
-      fail() { echo "::error::argo-workflow-submit: $*" >&2; exit 1; }
-
+      fail() { echo "::error::argo-workflow-submit: $*" >&2; echo "argo-workflow-submit: $*"; exit 1; }
       WORKSPACE=/github/workspace
       WORKFLOW_FILE="${INPUT_ARGO_WORKFLOW_FILE:-}"
       NAMESPACE="${INPUT_ARGO_NAMESPACE:-argo-events}"
       BRANCH="${INPUT_BRANCH:-}"
-      [ -n "$BRANCH" ] || BRANCH="${GITHUB_REF_NAME:-}"
-
+      if [ -z "$BRANCH" ]; then BRANCH="${GITHUB_REF_NAME:-}"; fi
       # Branch/tag names end up in bash scripts inside the Argo templates
       # (cwft-git clones with -b <branch>), so only allow a conservative subset
       # of what git accepts.
-      valid_ref() {
-        local r="$1"
-        [[ "$r" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] || return 1
-        case "$r" in
-          *..*|*//*|*/.*|*.lock|*/|*.) return 1 ;;
-        esac
-        return 0
-      }
+      valid_ref() { [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$ ]] || return 1; case "$1" in *..*|*//*|*/.*|*.lock|*/|*.) return 1 ;; esac; return 0; }
       valid_ref "$BRANCH" || fail "branch is not a valid ref name: refusing to submit"
-
       [[ "$NAMESPACE" =~ ^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$ ]] || fail "invalid argo_namespace"
-
-      [[ "$WORKFLOW_FILE" =~ ^\.argo/[A-Za-z0-9_][A-Za-z0-9._-]*\.ya?ml$ ]] \
-        || fail "argo_workflow_file must match ^\\.argo/<name>.y(a)ml$"
+      [[ "$WORKFLOW_FILE" =~ ^\.argo/[A-Za-z0-9_][A-Za-z0-9._-]*\.ya?ml$ ]] || fail "argo_workflow_file must match ^.argo/<name>.y(a)ml"
       WORKFLOW_PATH="$WORKSPACE/$WORKFLOW_FILE"
-      [ ! -L "$WORKSPACE/.argo" ] && [ ! -L "$WORKFLOW_PATH" ] && [ -f "$WORKFLOW_PATH" ] \
-        || fail "$WORKFLOW_FILE does not exist or is a symlink"
-
+      if [ -L "$WORKSPACE/.argo" ] || [ -L "$WORKFLOW_PATH" ] || [ ! -f "$WORKFLOW_PATH" ]; then fail "$WORKFLOW_FILE does not exist or is a symlink"; fi
       # The workflow manifest is read from the caller's checkout. On events
       # where that checkout can be pull request code, refuse unless the
       # checkout is the trusted commit GitHub resolved for the event
       # (GITHUB_SHA is the default-branch commit for issue_comment,
       # pull_request_target and workflow_run).
       workspace_head() {
-        local gitdir="$WORKSPACE/.git" head ref line sha name
-        [ -d "$gitdir" ] && [ ! -L "$gitdir" ] || return 1
-        head="$(<"$gitdir/HEAD")"
-        if [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then
-          echo "$head"; return 0
-        fi
-        [[ "$head" =~ ^ref:\ (refs/heads/[A-Za-z0-9._/-]+)$ ]] || return 1
-        ref="${BASH_REMATCH[1]}"
-        if [ -f "$gitdir/$ref" ]; then
-          sha="$(<"$gitdir/$ref")"
-          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && { echo "$sha"; return 0; }
-          return 1
-        fi
-        [ -f "$gitdir/packed-refs" ] || return 1
-        while read -r sha name; do
-          if [ "$name" = "$ref" ] && [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "$sha"; return 0
-          fi
-        done < "$gitdir/packed-refs"
-        return 1
+      local gitdir="$WORKSPACE/.git" head ref sha name
+      if [ ! -d "$gitdir" ] || [ -L "$gitdir" ]; then return 1; fi
+      head="$(<"$gitdir/HEAD")"
+      if [[ "$head" =~ ^[0-9a-f]{40}$ ]]; then echo "$head"; return 0; fi
+      [[ "$head" =~ ^ref:\ (refs/heads/[A-Za-z0-9._/-]+)$ ]] || return 1
+      ref="${BASH_REMATCH[1]}"
+      if [ -f "$gitdir/$ref" ]; then sha="$(<"$gitdir/$ref")"; [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1; echo "$sha"; return 0; fi
+      [ -f "$gitdir/packed-refs" ] || return 1
+      while read -r sha name; do
+      if [ "$name" = "$ref" ] && [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "$sha"; return 0; fi
+      done < "$gitdir/packed-refs"
+      return 1
       }
       case "${GITHUB_EVENT_NAME:-}" in
-        pull_request|pull_request_review|pull_request_review_comment)
-          fail "refusing to submit Argo workflows from a ${GITHUB_EVENT_NAME} event (workspace is pull request code)"
-          ;;
-        issue_comment|pull_request_target|workflow_run)
-          HEAD_SHA="$(workspace_head)" || fail "cannot resolve the workspace HEAD"
-          [ "$HEAD_SHA" = "${GITHUB_SHA:-}" ] \
-            || fail "workspace HEAD ($HEAD_SHA) is not the trusted event commit (${GITHUB_SHA:-}); check out the default branch, not the PR head"
-          ;;
+      pull_request|pull_request_review|pull_request_review_comment)
+      fail "refusing to submit Argo workflows from a ${GITHUB_EVENT_NAME} event (workspace is pull request code)" ;;
+      issue_comment|pull_request_target|workflow_run)
+      HEAD_SHA="$(workspace_head)" || fail "cannot resolve the workspace HEAD"
+      if [ "$HEAD_SHA" != "${GITHUB_SHA:-}" ]; then fail "workspace HEAD ($HEAD_SHA) is not the trusted event commit (${GITHUB_SHA:-}); check out the default branch, not the PR head"; fi ;;
       esac
-
       # Parse INPUT_PARAMETERS as a JSON array of strings, without eval.
       PARAMS=()
-      parse_params() {
-        local s="$1" n i c cur
-        n=${#s}; i=0
-        skip_ws() { while (( i < n )) && [[ "${s:i:1}" =~ [[:space:]] ]]; do i=$((i+1)); done; }
-        skip_ws
-        [ "${s:i:1}" = "[" ] || fail "parameters must be a JSON array of strings"
-        i=$((i+1)); skip_ws
-        if [ "${s:i:1}" = "]" ]; then i=$((i+1)); skip_ws; (( i == n )) || fail "trailing data after parameters array"; return; fi
-        while :; do
-          [ "${s:i:1}" = '"' ] || fail "parameters must be a JSON array of strings"
-          i=$((i+1)); cur=""
-          while :; do
-            (( i < n )) || fail "unterminated string in parameters"
-            c="${s:i:1}"
-            if [ "$c" = '"' ]; then i=$((i+1)); break; fi
-            if [ "$c" = '\' ]; then
-              i=$((i+1)); c="${s:i:1}"
-              case "$c" in
-                '"'|'\'|/) cur+="$c" ;;
-                *) fail "unsupported escape sequence in parameters" ;;
-              esac
-            else
-              cur+="$c"
-            fi
-            i=$((i+1))
-          done
-          PARAMS+=("$cur")
-          skip_ws
-          c="${s:i:1}"
-          if [ "$c" = "," ]; then i=$((i+1)); skip_ws; continue; fi
-          if [ "$c" = "]" ]; then i=$((i+1)); skip_ws; (( i == n )) || fail "trailing data after parameters array"; return; fi
-          fail "parameters must be a JSON array of strings"
-        done
-      }
-      parse_params "${INPUT_PARAMETERS:-}"
-
-      ARGS=()
-      for p in "${PARAMS[@]}"; do
-        # Expand only an allowlist of variable references (callers use
-        # "imageTag=${GITHUB_SHA}" and "imageTag=${BRANCH}").
-        for v in GITHUB_SHA GITHUB_REF_NAME GITHUB_REPOSITORY BRANCH; do
-          pat="\${$v}"
-          val="${!v-}"
-          p="${p//"$pat"/"$val"}"
-        done
-        [[ "$p" =~ ^[A-Za-z_][A-Za-z0-9_-]*=(.*)$ ]] || fail "parameter is not key=value: $p"
-        [[ "${BASH_REMATCH[1]}" =~ ^[A-Za-z0-9._/:=@,+*\ -]*$ ]] \
-          || fail "parameter value contains disallowed characters: ${p%%=*}"
-        ARGS+=("--parameter=$p")
+      S="${INPUT_PARAMETERS:-}"
+      N=${#S}
+      I=0
+      skip_ws() { while (( I < N )) && [[ "${S:I:1}" =~ [[:space:]] ]]; do I=$((I+1)); done; }
+      expect_end() { I=$((I+1)); skip_ws; (( I == N )) || fail "trailing data after parameters array"; }
+      skip_ws
+      [ "${S:I:1}" = "[" ] || fail "parameters must be a JSON array of strings"
+      I=$((I+1))
+      skip_ws
+      DONE=0
+      if [ "${S:I:1}" = "]" ]; then expect_end; DONE=1; fi
+      while (( DONE == 0 )); do
+      [ "${S:I:1}" = '"' ] || fail "parameters must be a JSON array of strings"
+      I=$((I+1))
+      CUR=""
+      while :; do
+      (( I < N )) || fail "unterminated string in parameters"
+      C="${S:I:1}"
+      if [ "$C" = '"' ]; then I=$((I+1)); break; fi
+      if [ "$C" = '\' ]; then
+      I=$((I+1))
+      C="${S:I:1}"
+      case "$C" in '"'|'\'|/) ;; *) fail "unsupported escape sequence in parameters" ;; esac
+      fi
+      CUR+="$C"
+      I=$((I+1))
       done
-
+      PARAMS+=("$CUR")
+      skip_ws
+      C="${S:I:1}"
+      if [ "$C" = "," ]; then I=$((I+1)); skip_ws; continue; fi
+      if [ "$C" = "]" ]; then expect_end; DONE=1; continue; fi
+      fail "parameters must be a JSON array of strings"
+      done
+      # Expand only an allowlist of variable references (callers use
+      # "imageTag=${GITHUB_SHA}" and "imageTag=${BRANCH}"), then restrict values
+      # to characters that are safe inside the Argo templates' bash scripts.
+      ARGS=()
+      for P in "${PARAMS[@]}"; do
+      for V in GITHUB_SHA GITHUB_REF_NAME GITHUB_REPOSITORY BRANCH; do PAT="\${$V}"; VAL="${!V-}"; P="${P//"$PAT"/"$VAL"}"; done
+      [[ "$P" =~ ^[A-Za-z_][A-Za-z0-9_-]*=(.*)$ ]] || fail "parameter is not key=value: ${P%%=*}"
+      [[ "${BASH_REMATCH[1]}" =~ ^[A-Za-z0-9._/:=@,+*\ -]*$ ]] || fail "parameter value contains disallowed characters: ${P%%=*}"
+      ARGS+=("--parameter=$P")
+      done
       APP_NAME="${GITHUB_REPOSITORY#*/}"
       APP_ORG="${GITHUB_REPOSITORY%%/*}"
       echo "BRANCH is $BRANCH"
-      argo submit "$WORKFLOW_PATH" \
-        --namespace="$NAMESPACE" \
-        --generate-name="${APP_NAME}-argo-submit-${GITHUB_SHA_SHORT:-}-" \
-        -p "appName=${APP_NAME}" \
-        -p "branch=${BRANCH}" \
-        -p "shortSha=${GITHUB_SHA:0:5}" \
-        -p "appOrg=${APP_ORG}" \
-        "${ARGS[@]}" \
-        --wait --log
+      argo submit "$WORKFLOW_PATH" --namespace="$NAMESPACE" --generate-name="${APP_NAME}-argo-submit-${GITHUB_SHA_SHORT:-}-" -p "appName=${APP_NAME}" -p "branch=${BRANCH}" -p "shortSha=${GITHUB_SHA:0:5}" -p "appOrg=${APP_ORG}" "${ARGS[@]}" --wait --log
